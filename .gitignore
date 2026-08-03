@@ -1,0 +1,10 @@
+﻿.venv/
+__pycache__/
+*.pyc
+
+# 本地数据缓存不要上传
+data/cache/
+
+# 大文件结果可选不上传，但保留净值图
+output/*.csv
+output/*.json

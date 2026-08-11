@@ -3,6 +3,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from config import USE_POSITION_CONTROL, POSITION_METHOD, POSITION_MA_MONTHS, POSITION_LOW, POSITION_DD_STEPS
 
 
 def monthly_close_from_prices(prices, codes, month_end_dates, ffill_limit=1):
@@ -59,45 +60,86 @@ def index_monthly_returns(index_daily, month_end_dates):
 
     return s.pct_change()
 
-
-def portfolio_returns(holdings, monthly_ret, rebalance_dates):
+def compute_positions(index_daily, rebalance_dates):
     """
-    计算组合月度收益率。
+    简易仓位管理（只用调仓日已知的基准数据，防未来函数）。
+    """
+    if not USE_POSITION_CONTROL:
+        return {pd.Timestamp(d): 1.0 for d in rebalance_dates}
 
-    逻辑：
-    在 d0 月末选股；
-    持有到 d1 月末；
-    组合收益为选中股票 d1 月收益的均值。
+    df = index_daily.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    g = df.groupby(df["date"].dt.to_period("M"))
+    monthly = pd.Series(
+        g["close"].last().values,
+        index=pd.DatetimeIndex(g["date"].max().values),
+    ).sort_index()
+
+    positions = {}
+    for d in rebalance_dates:
+        d = pd.Timestamp(d)
+        hist = monthly[monthly.index <= d]
+
+        if len(hist) < 3:
+            positions[d] = 1.0
+            continue
+
+        close = hist.iloc[-1]
+
+        if POSITION_METHOD == "ma":
+            ma = hist.tail(POSITION_MA_MONTHS).mean()
+            positions[d] = 1.0 if close > ma else POSITION_LOW
+        elif POSITION_METHOD == "drawdown":
+            dd = close / hist.max() - 1
+            level = 1.0
+            for th, lv in POSITION_DD_STEPS:
+                if dd <= th:
+                    level = lv
+            positions[d] = level
+        else:
+            positions[d] = 1.0
+
+    return positions
+
+
+def portfolio_returns(holdings, monthly_ret, rebalance_dates, cost_rate=0.003, positions=None):
+    """
+    计算组合月度收益并扣除交易成本。
+    positions: {调仓日: 仓位0~1}，None 表示永远满仓。
     """
     rets = []
     dates = []
+    turnovers = []
+    prev_w = {}
 
     for i in range(len(rebalance_dates) - 1):
         d0 = pd.Timestamp(rebalance_dates[i])
         d1 = pd.Timestamp(rebalance_dates[i + 1])
 
         stocks = holdings.get(d0, [])
+        p = positions.get(d0, 1.0) if positions else 1.0
 
-        if d1 not in monthly_ret.index:
-            continue
+        # 目标权重：权益部分等权，总仓位 = p
+        w = {c: p / len(stocks) for c in stocks} if stocks else {}
 
-        if len(stocks) == 0:
-            r = 0.0
+        # 交易量 = 权重变动绝对值之和（含选股换手 + 仓位变动），成本 = 交易量 × 单边成本
+        all_codes = set(w) | set(prev_w)
+        traded = sum(abs(w.get(c, 0.0) - prev_w.get(c, 0.0)) for c in all_codes)
+        cost = traded * cost_rate
+
+        if d1 in monthly_ret.index and stocks:
+            valid = [c for c in stocks
+                     if c in monthly_ret.columns and not pd.isna(monthly_ret.loc[d1, c])]
+            r = p * monthly_ret.loc[d1, valid].mean(skipna=True) if valid else 0.0
         else:
-            valid_cols = [c for c in stocks if c in monthly_ret.columns]
+            r = 0.0
 
-            if len(valid_cols) == 0:
-                r = 0.0
-            else:
-                r = monthly_ret.loc[d1, valid_cols].mean(skipna=True)
-
-                if pd.isna(r):
-                    r = 0.0
-
-        rets.append(float(r))
+        rets.append(float(r - cost))
         dates.append(d1)
+        turnovers.append(traded / 2)   # 单边换手率
+        prev_w = w
 
-    return pd.Series(rets, index=pd.DatetimeIndex(dates), name="strategy")
+    return pd.Series(rets, index=pd.DatetimeIndex(dates), name="strategy"), turnovers
 
 
 def performance_metrics(ret, periods_per_year=12):

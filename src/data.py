@@ -4,6 +4,7 @@ from pathlib import Path
 import akshare as ak
 import pandas as pd
 import numpy as np
+import time
 
 from config import CACHE_DIR, DATA_START_DATE, END_DATE
 
@@ -247,3 +248,87 @@ def get_financial_indicator(code, start_year="2017"):
 
     out.to_parquet(fp, index=False)
     return out
+
+# ---------------- 历史总市值（百度源） ----------------
+def get_stock_mcap(code):
+    fp = _cache_file(f"mcap_{code}.parquet")
+    if fp.exists():
+        return pd.read_parquet(fp)
+
+    out = pd.DataFrame(columns=["date", "mcap"])
+    try:
+        raw = ak.stock_zh_valuation_baidu(symbol=code, indicator="总市值", period="全部")
+        if raw is not None and not raw.empty:
+            raw = raw.rename(columns={"value": "mcap"})
+            raw["date"] = pd.to_datetime(raw["date"])
+            raw["mcap"] = pd.to_numeric(raw["mcap"], errors="coerce")
+            out = raw[["date", "mcap"]].dropna()
+            out = out[(out["date"] >= DATA_START_DATE) & (out["date"] <= END_DATE)]
+            out = out.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        print(f"{code} 百度市值 error: {e}")
+
+    if not out.empty:
+        out.to_parquet(fp, index=False)
+    return out
+
+
+# ---------------- 行业分类 ----------------
+def _fetch_industry_sina():
+    """源1：新浪行业分类（全市场，一次性缓存）"""
+    try:
+        sectors = ak.stock_sector_spot(indicator="新浪行业")
+        rows = []
+        for _, s in sectors.iterrows():
+            try:
+                det = ak.stock_sector_detail(sector=str(s["label"]))
+                sub = det[["code"]].copy()
+                sub["code"] = sub["code"].astype(str).str.zfill(6)
+                sub["industry"] = str(s["板块"])
+                rows.append(sub)
+                time.sleep(0.2)
+            except Exception:
+                continue
+        if rows:
+            full = pd.concat(rows, ignore_index=True).drop_duplicates("code")
+            if len(full) > 100:
+                return full
+    except Exception as e:
+        print(f"新浪行业 error: {e}")
+    return None
+
+
+def _fetch_industry_em(codes):
+    """源2：东财个股信息（只拉股票池）"""
+    rows = []
+    try:
+        for code in codes:
+            info = ak.stock_individual_info_em(symbol=code)
+            v = info[info["item"] == "行业"]["value"]
+            if len(v) > 0:
+                rows.append({"code": code, "industry": str(v.iloc[0])})
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"东财行业 error: {e}")
+    return pd.DataFrame(rows) if rows else None
+
+
+def get_industry_map(codes):
+    """返回 {code: 行业名}，失败时全部返回 unknown（自动退化为不做行业中性化）"""
+    fp = _cache_file("industry_map.csv")
+
+    if fp.exists():
+        full = pd.read_csv(fp, dtype={"code": str})
+    else:
+        full = _fetch_industry_sina()
+        if (full is None or full.empty):
+            full = _fetch_industry_em(codes)
+        if full is not None and not full.empty:
+            full.to_csv(fp, index=False)
+
+    if full is None or full.empty:
+        print("警告：行业数据获取失败，本次不做行业中性化")
+        return {c: "unknown" for c in codes}
+
+    m = dict(zip(full["code"].astype(str), full["industry"].astype(str)))
+    return {c: m.get(c, "unknown") for c in codes}

@@ -3,15 +3,14 @@
 import numpy as np
 import pandas as pd
 
-from config import FACTOR_DIRECTION, MIN_FACTORS
+from config import FACTOR_DIRECTION, MIN_FACTORS, NEUTRALIZE_INDUSTRY, NEUTRALIZE_MCAP
 
 
 def get_month_end_trading_dates(index_daily, start_date, end_date):
     df = index_daily.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df[(df["date"] >= pd.Timestamp(start_date)) & (df["date"] <= pd.Timestamp(end_date))]
-    month_ends = df.groupby(df["date"].dt.to_period("M"))["date"].max().tolist()
-    return month_ends
+    return df.groupby(df["date"].dt.to_period("M"))["date"].max().tolist()
 
 
 def latest_value_before(df, date, col):
@@ -48,7 +47,7 @@ def latest_fin_before(fin_df, date):
     ]
 
 
-def build_panel(codes, prices, pbs, fins, rebalance_dates):
+def build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=None):
     rows = []
     for date in rebalance_dates:
         for code in codes:
@@ -56,23 +55,18 @@ def build_panel(codes, prices, pbs, fins, rebalance_dates):
             pb = latest_value_before(pbs.get(code), date, "pb")
             mom_6m = get_momentum(price_df, date, lookback=126)
             roe, gross_margin, revenue_yoy, debt_to_asset = latest_fin_before(fins.get(code), date)
+            mcap = latest_value_before(mcaps.get(code), date, "mcap") if mcaps is not None else np.nan
             rows.append({
-                "date": date,
-                "code": code,
-                "pb": pb,
-                "roe": roe,
-                "gross_margin": gross_margin,
-                "revenue_yoy": revenue_yoy,
-                "debt_to_asset": debt_to_asset,
-                "mom_6m": mom_6m,
+                "date": date, "code": code, "pb": pb, "roe": roe,
+                "gross_margin": gross_margin, "revenue_yoy": revenue_yoy,
+                "debt_to_asset": debt_to_asset, "mom_6m": mom_6m, "mcap": mcap,
             })
 
     if not rows:
         return pd.DataFrame(columns=[
             "date", "code", "pb", "roe", "gross_margin",
-            "revenue_yoy", "debt_to_asset", "mom_6m",
+            "revenue_yoy", "debt_to_asset", "mom_6m", "mcap",
         ])
-
     return pd.DataFrame(rows)
 
 
@@ -94,37 +88,101 @@ def standardize(s):
     return (s - valid.mean()) / std
 
 
-def preprocess_cross_section(df):
+def neutralize_cross_section(df, factors):
+    """
+    横截面回归剔除市值与行业暴露，残差作为新因子：
+    factor = a + b*ln(mcap) + 行业哑变量 + epsilon
+    """
     out = df.copy()
+    use_mc = NEUTRALIZE_MCAP and "mcap" in out.columns and out["mcap"].notna().sum() >= 10
+    use_ind = NEUTRALIZE_INDUSTRY and "industry" in out.columns
+
+    for f in factors:
+        if f not in out.columns:
+            continue
+
+        y = pd.to_numeric(out[f], errors="coerce")
+        y = winsorize(y)   # 回归前去极值，避免极端值拉动回归线
+        mask = y.notna()
+
+        X_parts = []
+        if use_mc:
+            lm = np.log(out["mcap"].clip(lower=1e-6))
+            mask = mask & lm.notna()
+            X_parts.append(lm.rename("log_mcap"))
+        if use_ind:
+            dummies = pd.get_dummies(out["industry"].fillna("unknown"), prefix="ind")
+            if dummies.shape[1] > 1:
+                dummies = dummies.drop(columns=dummies.columns[0])
+                X_parts.append(dummies)
+
+        if not X_parts:
+            out[f"{f}_n"] = y
+            continue
+
+        X = pd.concat(X_parts, axis=1).astype(float)
+        mask = mask & X.notna().all(axis=1)
+
+        if mask.sum() <= X.shape[1] + 3:
+            out[f"{f}_n"] = y
+            continue
+
+        yv = y.loc[mask].to_numpy(dtype=float)
+        Xv = X.loc[mask].to_numpy(dtype=float)
+        Xv = np.column_stack([np.ones(len(Xv)), Xv])
+
+        beta, _, _, _ = np.linalg.lstsq(Xv, yv, rcond=None)
+        resid = yv - Xv @ beta
+
+        new_col = pd.Series(np.nan, index=out.index)
+        new_col.loc[mask] = resid
+        out[f"{f}_n"] = new_col
+
+    return out
+
+
+def preprocess_cross_section(df, weights=None):
+    out = neutralize_cross_section(df, list(FACTOR_DIRECTION.keys()))
+
     zcols = []
     for raw, direction in FACTOR_DIRECTION.items():
         zcol = f"{raw}_z"
         zcols.append(zcol)
-        if raw not in out.columns:
-            out[zcol] = np.nan
-            continue
-        s = winsorize(out[raw])
+        src = f"{raw}_n" if f"{raw}_n" in out.columns else raw
+        s = winsorize(out[src])
         s = standardize(s)
         out[zcol] = s * direction
 
     out["z_count"] = out[zcols].notna().sum(axis=1)
-    out["score"] = out[zcols].mean(axis=1, skipna=True)
+
+    if weights:
+        # 加权合成：缺失的因子按0贡献，并按剩余权重重新归一
+        num = pd.Series(0.0, index=out.index)
+        den = pd.Series(0.0, index=out.index)
+        for raw in FACTOR_DIRECTION.keys():
+            zc = f"{raw}_z"
+            w = weights.get(raw, 0.0)
+            num = num + out[zc].fillna(0.0) * w
+            den = den + out[zc].notna().astype(float) * w
+        out["score"] = num / den.replace(0, np.nan)
+    else:
+        out["score"] = out[zcols].mean(axis=1, skipna=True)
+
     out.loc[out["z_count"] < MIN_FACTORS, "score"] = np.nan
     return out
 
 
-def compute_scores(panel):
+def compute_scores(panel, weights_by_date=None):
     if panel is None or panel.empty or "date" not in panel.columns:
         return panel
 
     results = []
     for date, df in panel.groupby("date"):
-        scored = preprocess_cross_section(df)
-        results.append(scored)
+        w = weights_by_date.get(date) if weights_by_date else None
+        results.append(preprocess_cross_section(df, w))
 
     if not results:
         return panel
-
     return pd.concat(results, ignore_index=True)
 
 

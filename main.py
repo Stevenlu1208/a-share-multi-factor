@@ -9,30 +9,23 @@ from tqdm import tqdm
 
 from config import *
 from src.data import (
-    get_universe,
-    get_index_daily,
-    get_stock_price,
-    get_stock_pb,
-    get_financial_indicator,
+    get_universe, get_index_daily, get_stock_price, get_stock_pb,
+    get_financial_indicator, get_stock_mcap, get_industry_map,
 )
 from src.factors import (
-    get_month_end_trading_dates,
-    build_panel,
-    compute_scores,
-    select_top,
+    get_month_end_trading_dates, build_panel, compute_scores, select_top,
 )
 from src.backtest import (
-    monthly_close_from_prices,
-    monthly_returns,
-    index_monthly_returns,
-    portfolio_returns,
-    performance_metrics,
-    plot_nav,
+    monthly_close_from_prices, monthly_returns, index_monthly_returns,
+    portfolio_returns, performance_metrics, plot_nav, compute_positions,
+)
+from src.factor_test import (
+    calculate_forward_returns, run_ic_and_quintile_tests, rolling_icir_weights,
 )
 
 
 def load_stock_data(codes):
-    prices, pbs, fins = {}, {}, {}
+    prices, pbs, fins, mcaps = {}, {}, {}, {}
     start_year = str(int(DATA_START_DATE[:4]) - 1)
 
     for code in tqdm(codes, desc="Download data"):
@@ -49,12 +42,18 @@ def load_stock_data(codes):
             print(f"{code} pb error: {e}")
 
         try:
+            mcaps[code] = get_stock_mcap(code)
+            time.sleep(0.15)
+        except Exception as e:
+            print(f"{code} mcap error: {e}")
+
+        try:
             fins[code] = get_financial_indicator(code, start_year=start_year)
             time.sleep(0.15)
         except Exception as e:
             print(f"{code} financial error: {e}")
 
-    return prices, pbs, fins
+    return prices, pbs, fins, mcaps
 
 
 def save_holdings(holdings, path):
@@ -95,14 +94,32 @@ def main():
         return
 
     print("开始下载个股数据，第一次会比较慢，请耐心等待。")
-    prices, pbs, fins = load_stock_data(codes)
+    prices, pbs, fins, mcaps = load_stock_data(codes)
+
+    print("开始获取行业分类。")
+    industry_map = get_industry_map(codes)
 
     print("开始构建因子面板。")
-    panel = build_panel(codes, prices, pbs, fins, rebalance_dates)
+    panel = build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=mcaps)
+    panel["industry"] = panel["code"].map(industry_map).fillna("unknown")
     print(f"因子面板行数：{len(panel)}")
 
-    print("开始因子标准化与打分。")
-    panel = compute_scores(panel)
+    # 先算收益矩阵（权重计算需要用到"未来收益"的历史，但只用过去部分）
+    close = monthly_close_from_prices(prices, codes, all_month_ends, ffill_limit=1)
+    fwd_ret = calculate_forward_returns(close)
+
+    # 计算滚动 ICIR 权重
+    weights_by_date = None
+    if USE_IC_WEIGHTS:
+        print("开始计算滚动 ICIR 因子权重。")
+        weights_by_date = rolling_icir_weights(
+            panel, fwd_ret, rebalance_dates, window=IC_WEIGHT_WINDOW
+        )
+        last_w = weights_by_date.get(rebalance_dates[-1], {})
+        print("最新一期因子权重：", {k: round(v, 3) for k, v in last_w.items()})
+
+    print("开始因子中性化、标准化与打分。")
+    panel = compute_scores(panel, weights_by_date)
 
     print("开始选股。")
     holdings = select_top(panel, TOP_N)
@@ -111,11 +128,25 @@ def main():
         print("没有有效持仓，请检查数据完整性。")
         return
 
-    close = monthly_close_from_prices(prices, codes, all_month_ends, ffill_limit=1)
     stock_ret = monthly_returns(close)
     bench_ret = index_monthly_returns(index_daily, all_month_ends)
 
-    strategy_ret = portfolio_returns(holdings, stock_ret, rebalance_dates).sort_index()
+    # 仓位管理：上涨（趋势内）满仓，下跌（破位/深回撤）自动减仓
+    positions = compute_positions(index_daily, rebalance_dates)
+    avg_pos = sum(positions.values()) / len(positions)
+    print(f"🎚️ 历史平均仓位: {avg_pos:.2%}")
+
+    # 传入成本参数，并接收换手率数据
+    strategy_ret, turnovers = portfolio_returns(
+        holdings, stock_ret, rebalance_dates, TRADE_COST_SINGLE, positions=positions
+    )
+    strategy_ret = strategy_ret.sort_index()
+
+    # 打印换手率和成本评估
+    if turnovers:
+        avg_turnover = sum(turnovers) / len(turnovers)
+        print(f"📊 平均每月单边换手率: {avg_turnover:.2%}")
+        print(f"💸 预计年化交易总成本: {avg_turnover * TRADE_COST_SINGLE * 2 * 12:.2%}")
 
     metrics = performance_metrics(strategy_ret, periods_per_year=12)
     bench_metrics = performance_metrics(
@@ -127,6 +158,9 @@ def main():
 
     if len(strategy_ret) > 0:
         plot_nav(strategy_ret, bench_ret, Path(OUTPUT_DIR) / "nav.png")
+
+    print("\n--- 开始进行单因子检验 (IC与分组回测) ---")
+    run_ic_and_quintile_tests(panel, fwd_ret)
 
     result = {"strategy": metrics, "benchmark": bench_metrics}
     with open(Path(OUTPUT_DIR) / "metrics.json", "w", encoding="utf-8") as f:

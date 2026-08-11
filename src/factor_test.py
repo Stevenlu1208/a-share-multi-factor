@@ -194,3 +194,52 @@ def rolling_icir_weights(panel, fwd_ret, dates, window=12, min_periods=6):
         weights_by_date[date] = {f: v / total for f, v in w.items()}
 
     return weights_by_date
+
+
+def subperiod_ic_report(panel, fwd_ret, periods=None):
+    """
+    分阶段因子稳定性报告：检验因子IC在不同市场regime下是否方向一致。
+    """
+    if periods is None:
+        periods = [
+            ("2014-2017", "2014-01-01", "2017-12-31"),
+            ("2018-2021", "2018-01-01", "2021-12-31"),
+            ("2022-2024", "2022-01-01", "2024-12-31"),
+        ]
+
+    base = [f for f in FACTOR_DIRECTION.keys() if f in panel.columns]
+    neut = [f"{f}_n" for f in FACTOR_DIRECTION.keys() if f"{f}_n" in panel.columns]
+    factor_cols = base + neut
+
+    merged = pd.merge(
+        panel[["date", "code"] + factor_cols],
+        fwd_ret, on=["date", "code"], how="inner",
+    ).dropna(subset=["fwd_ret"])
+    merged["date"] = pd.to_datetime(merged["date"])
+
+    rows = []
+    for name, s, e in periods:
+        sub = merged[(merged["date"] >= s) & (merged["date"] <= e)]
+        for f in factor_cols:
+            direction = FACTOR_DIRECTION.get(f, FACTOR_DIRECTION.get(f[:-2], 1))
+            ic_list = []
+            for date, g in sub.groupby("date"):
+                valid = g[[f, "fwd_ret"]].dropna()
+                if len(valid) >= 10:
+                    ic, _ = stats.spearmanr(valid[f] * direction, valid["fwd_ret"])
+                    ic_list.append(ic)
+            if ic_list:
+                ic_s = pd.Series(ic_list)
+                rows.append({
+                    "period": name,
+                    "factor": f,
+                    "Effective_IC": round(ic_s.mean(), 4),
+                    "ICIR": round(ic_s.mean() / ic_s.std(), 3) if ic_s.std() > 0 else 0,
+                    "WinRate": f"{(ic_s > 0).mean():.0%}",
+                })
+
+    report = pd.DataFrame(rows)
+    print("\n=== 因子分阶段稳定性（方向调整后） ===")
+    print(report.to_string(index=False))
+    report.to_csv(OUT_DIR / "subperiod_ic.csv", index=False)
+    return report

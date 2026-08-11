@@ -20,7 +20,8 @@ from src.backtest import (
     portfolio_returns, performance_metrics, plot_nav, compute_positions,
 )
 from src.factor_test import (
-    calculate_forward_returns, run_ic_and_quintile_tests, rolling_icir_weights,
+    calculate_forward_returns, run_ic_and_quintile_tests,
+    rolling_icir_weights, subperiod_ic_report,
 )
 
 
@@ -161,6 +162,7 @@ def main():
 
     print("\n--- 开始进行单因子检验 (IC与分组回测) ---")
     run_ic_and_quintile_tests(panel, fwd_ret)
+    subperiod_ic_report(panel, fwd_ret)
 
     result = {"strategy": metrics, "benchmark": bench_metrics}
     with open(Path(OUTPUT_DIR) / "metrics.json", "w", encoding="utf-8") as f:

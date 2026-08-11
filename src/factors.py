@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from config import FACTOR_DIRECTION, MIN_FACTORS, NEUTRALIZE_INDUSTRY, NEUTRALIZE_MCAP
+from config import FACTOR_DIRECTION, MIN_FACTORS, NEUTRALIZE_INDUSTRY, NEUTRALIZE_MCAP, MAX_PER_INDUSTRY
 
 
 def get_month_end_trading_dates(index_daily, start_date, end_date):
@@ -189,8 +189,22 @@ def compute_scores(panel, weights_by_date=None):
 def select_top(panel, top_n=30):
     if panel is None or panel.empty or "date" not in panel.columns:
         return {}
+
     holdings = {}
     for date, df in panel.groupby("date"):
         df = df.dropna(subset=["score"]).sort_values("score", ascending=False)
-        holdings[date] = df.head(top_n)["code"].tolist()
+
+        if "industry" in df.columns and MAX_PER_INDUSTRY:
+            chosen, count = [], {}
+            for code, ind in zip(df["code"], df["industry"]):
+                if count.get(ind, 0) >= MAX_PER_INDUSTRY:
+                    continue
+                chosen.append(code)
+                count[ind] = count.get(ind, 0) + 1
+                if len(chosen) >= top_n:
+                    break
+            holdings[date] = chosen
+        else:
+            holdings[date] = df.head(top_n)["code"].tolist()
+
     return holdings

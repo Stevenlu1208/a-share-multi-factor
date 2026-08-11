@@ -19,7 +19,7 @@ def calculate_forward_returns(close_df):
     计算未来一个月的收益率。
     close_df: 月末收盘价矩阵 (index=date, columns=codes)
     """
-    ret = close_df.pct_change().shift(-1) # shift(-1) 表示下个月的收益
+    ret = close_df.pct_change(fill_method=None).shift(-1) # shift(-1) 表示下个月的收益
     ret = ret.stack().reset_index()
     ret.columns = ["date", "code", "fwd_ret"]
     return ret
@@ -100,7 +100,9 @@ def run_ic_and_quintile_tests(panel, fwd_ret_df):
                 continue
             
             # 按因子值从小到大排序，分成 5 组
-            sorted_g = valid.sort_values(by=factor)
+            # 按"方向调整后"值排序，保证 Q1=理论最差、Q5=理论最好（正负因子统一）
+            direction = FACTOR_DIRECTION.get(factor, FACTOR_DIRECTION.get(factor[:-2], 1))
+            sorted_g = valid.assign(_adj=valid[factor] * direction).sort_values("_adj")
             q_size = len(sorted_g) // 5
             for q in range(1, 6):
                 if q < 5:

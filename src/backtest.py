@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from config import USE_POSITION_CONTROL, POSITION_METHOD, POSITION_MA_MONTHS, POSITION_LOW, POSITION_DD_STEPS
+from config import USE_POSITION_CONTROL, POSITION_METHOD, POSITION_MA_MONTHS, POSITION_LOW, POSITION_DD_STEPS, RISK_FREE_ANNUAL
 
 
 def monthly_close_from_prices(prices, codes, month_end_dates, ffill_limit=1):
@@ -143,40 +143,24 @@ def portfolio_returns(holdings, monthly_ret, rebalance_dates, cost_rate=0.003, p
 
 
 def performance_metrics(ret, periods_per_year=12):
-    """
-    计算绩效指标。
-    """
     ret = ret.dropna()
-
     if len(ret) == 0:
-        return {}
+        return {k: np.nan for k in ["累计收益", "年化收益", "年化波动", "夏普比率", "最大回撤"]}
 
     nav = (1 + ret).cumprod()
-
     years = len(ret) / periods_per_year
-
-    total_return = nav.iloc[-1] - 1
-
-    if years > 0:
-        cagr = nav.iloc[-1] ** (1 / years) - 1
-    else:
-        cagr = np.nan
-
-    vol = ret.std() * np.sqrt(periods_per_year)
-
-    if vol != 0:
-        sharpe = (ret.mean() * periods_per_year) / vol
-    else:
-        sharpe = np.nan
-
-    max_drawdown = (nav / nav.cummax() - 1).min()
+    cumulative = float(nav.iloc[-1] - 1)
+    annual = float(nav.iloc[-1] ** (1 / years) - 1)
+    vol = float(ret.std() * np.sqrt(periods_per_year))
+    sharpe = float((annual - RISK_FREE_ANNUAL) / vol) if vol > 0 else np.nan
+    maxdd = float((nav / nav.cummax() - 1).min())
 
     return {
-        "累计收益": float(total_return),
-        "年化收益": float(cagr),
-        "年化波动": float(vol),
-        "夏普比率": float(sharpe),
-        "最大回撤": float(max_drawdown)
+        "累计收益": cumulative,
+        "年化收益": annual,
+        "年化波动": vol,
+        "夏普比率": sharpe,
+        "最大回撤": maxdd,
     }
 
 

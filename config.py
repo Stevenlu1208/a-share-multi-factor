@@ -58,3 +58,9 @@ POSITION_METHOD = "ma"        # "ma": N月均线择时 | "drawdown": 回撤分�
 POSITION_MA_MONTHS = 10       # 月均线周期
 POSITION_LOW = 0.5            # 跌破均线后的仓位
 POSITION_DD_STEPS = [(-0.10, 0.5), (-0.20, 0.2)]   # (回撤阈值, 仓位)
+
+# 无风险利率（夏普比率改为超额口径）
+RISK_FREE_ANNUAL = 0.02
+
+# 选股风控：单一行业最多持有几只
+MAX_PER_INDUSTRY = 6

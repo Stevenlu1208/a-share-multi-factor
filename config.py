@@ -9,13 +9,11 @@ START_DATE = "2014-01-01"
 # 策略结束时间
 END_DATE = "2024-12-31"
 
-# 股票池指数，沪深300
-UNIVERSE_INDEX = "000300"
-
-# 指数行情代码，沪深300通常用 sh000300
+# 股票池
+UNIVERSE_INDEX = ["000300", "000905"]
+# 基准指数（净值对比 + 均线择时用）
 INDEX_SYMBOL = "sh000300"
-
-MAX_STOCKS = None
+MAX_STOCKS = None                       # 全量
 
 # 每个月选择前 N 只股票
 TOP_N = 30
@@ -30,13 +28,18 @@ OUTPUT_DIR = "output"
 # 1 表示因子越大越好
 # -1 表示因子越小越好
 FACTOR_DIRECTION = {
-    "pb": -1,            # 价值因子，PB 越低越好
-    "roe": 1,            # 质量因子，ROE 越高越好
-    "gross_margin": 1,    # 质量因子，毛利率越高越好
-    "revenue_yoy": 1,     # 成长因子，营收同比增速越高越好
-    "debt_to_asset": -1,  # 风险因子，资产负债率越低越好
-    "mom_6m": -1,         # 过去6个月收益率，这里先按反转处理
-}
+    "pb": -1,
+    "roe": 1,
+    "gross_margin": 1,
+    "revenue_yoy": 1,
+    "mcap": -1,       # 规模：越小越好（小市值效应）
+    "turnover": -1,   # 换手率：越低越好（低换手异象）
+    "mom_1m": -1,
+    "vol_1m": -1,
+} 
+
+# 不做市值/行业中性化的因子（保留原始截面信号）
+NO_NEUTRALIZE_FACTORS = ["mcap"]
 
 # 一只股票至少要有多少个因子有效，否则不打分
 MIN_FACTORS = 1
@@ -64,3 +67,8 @@ RISK_FREE_ANNUAL = 0.02
 
 # 选股风控：单一行业最多持有几只
 MAX_PER_INDUSTRY = 6
+
+# 停牌判定：调仓日距离最后交易日超过该天数(自然日)视为停牌
+SUSPENSION_GAP_DAYS = 7
+# 停牌期间价格向前填充的月数上限（冻结期记0收益，复牌捕捉跳空）
+FFILL_LIMIT = 3

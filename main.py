@@ -10,7 +10,7 @@ from tqdm import tqdm
 from config import *
 from src.data import (
     get_universe, get_index_daily, get_stock_price, get_stock_pb,
-    get_financial_indicator, get_stock_mcap, get_industry_map,
+    get_financial_indicator, get_stock_mcap, get_industry_map, get_suspended_map, get_stock_turnover
 )
 from src.factors import (
     get_month_end_trading_dates, build_panel, compute_scores, select_top,
@@ -26,7 +26,7 @@ from src.factor_test import (
 
 
 def load_stock_data(codes):
-    prices, pbs, fins, mcaps = {}, {}, {}, {}
+    prices, pbs, fins, mcaps, turnovers = {}, {}, {}, {}, {}
     start_year = str(int(DATA_START_DATE[:4]) - 1)
 
     for code in tqdm(codes, desc="Download data"):
@@ -54,7 +54,13 @@ def load_stock_data(codes):
         except Exception as e:
             print(f"{code} financial error: {e}")
 
-    return prices, pbs, fins, mcaps
+        try:
+            turnovers[code] = get_stock_turnover(code)
+            time.sleep(0.15)
+        except Exception as e:
+            print(f"{code} turnover error: {e}")
+
+    return prices, pbs, fins, mcaps, turnovers
 
 
 def save_holdings(holdings, path):
@@ -95,18 +101,18 @@ def main():
         return
 
     print("开始下载个股数据，第一次会比较慢，请耐心等待。")
-    prices, pbs, fins, mcaps = load_stock_data(codes)
+    prices, pbs, fins, mcaps, turnovers = load_stock_data(codes)
 
     print("开始获取行业分类。")
     industry_map = get_industry_map(codes)
 
     print("开始构建因子面板。")
-    panel = build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=mcaps)
+    panel = build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=mcaps, turnovers=turnovers)
     panel["industry"] = panel["code"].map(industry_map).fillna("unknown")
     print(f"因子面板行数：{len(panel)}")
 
     # 先算收益矩阵（权重计算需要用到"未来收益"的历史，但只用过去部分）
-    close = monthly_close_from_prices(prices, codes, all_month_ends, ffill_limit=1)
+    close = monthly_close_from_prices(prices, codes, all_month_ends, ffill_limit=FFILL_LIMIT)
     fwd_ret = calculate_forward_returns(close)
 
     # 计算滚动 ICIR 权重
@@ -122,8 +128,12 @@ def main():
     print("开始因子中性化、标准化与打分。")
     panel = compute_scores(panel, weights_by_date)
 
-    print("开始选股。")
-    holdings = select_top(panel, TOP_N)
+    print("开始选股（含停牌约束）。")
+    suspended = get_suspended_map(prices, rebalance_dates, SUSPENSION_GAP_DAYS)
+    avg_susp = sum(len(v) for v in suspended.values()) / len(suspended)
+    print(f"🚫 平均每月停牌股数量: {avg_susp:.1f}")
+
+    holdings = select_top(panel, TOP_N, suspended=suspended)
 
     if not holdings:
         print("没有有效持仓，请检查数据完整性。")

@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from config import FACTOR_DIRECTION, MIN_FACTORS, NEUTRALIZE_INDUSTRY, NEUTRALIZE_MCAP, MAX_PER_INDUSTRY
+from config import FACTOR_DIRECTION, MIN_FACTORS, NEUTRALIZE_INDUSTRY, NEUTRALIZE_MCAP, MAX_PER_INDUSTRY, NO_NEUTRALIZE_FACTORS
 
 
 def get_month_end_trading_dates(index_daily, start_date, end_date):
@@ -31,6 +31,22 @@ def get_momentum(price_df, date, lookback=126):
     window = hist.tail(lookback + 1)
     return window["close"].iloc[-1] / window["close"].iloc[0] - 1.0
 
+def get_volatility(price_df, date, lookback=20):
+    """
+    过去1个月波动率：最近约20个交易日日收益率的标准差。
+    （是否年化不影响结果，横截面标准化会消除量纲。）
+    """
+    if price_df is None or price_df.empty:
+        return np.nan
+    hist = price_df[price_df["date"] <= date].sort_values("date")
+    if len(hist) < lookback + 1:
+        return np.nan
+    window = hist.tail(lookback + 1)
+    ret = window["close"].pct_change().dropna()
+    if len(ret) < lookback * 0.8:
+        return np.nan
+    return ret.std()
+
 
 def latest_fin_before(fin_df, date):
     if fin_df is None or fin_df.empty:
@@ -47,25 +63,28 @@ def latest_fin_before(fin_df, date):
     ]
 
 
-def build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=None):
+def build_panel(codes, prices, pbs, fins, rebalance_dates, mcaps=None, turnovers=None):
     rows = []
     for date in rebalance_dates:
         for code in codes:
             price_df = prices.get(code)
             pb = latest_value_before(pbs.get(code), date, "pb")
-            mom_6m = get_momentum(price_df, date, lookback=126)
+            mom_1m = get_momentum(price_df, date, lookback=20)
+            vol_1m = get_volatility(price_df, date, lookback=20)
             roe, gross_margin, revenue_yoy, debt_to_asset = latest_fin_before(fins.get(code), date)
             mcap = latest_value_before(mcaps.get(code), date, "mcap") if mcaps is not None else np.nan
+            turnover = latest_value_before(turnovers.get(code), date, "turnover") if turnovers is not None else np.nan
             rows.append({
                 "date": date, "code": code, "pb": pb, "roe": roe,
                 "gross_margin": gross_margin, "revenue_yoy": revenue_yoy,
-                "debt_to_asset": debt_to_asset, "mom_6m": mom_6m, "mcap": mcap,
+                "debt_to_asset": debt_to_asset, "mcap": mcap,
+                "turnover": turnover, "mom_1m": mom_1m, "vol_1m": vol_1m,
             })
 
     if not rows:
         return pd.DataFrame(columns=[
-            "date", "code", "pb", "roe", "gross_margin",
-            "revenue_yoy", "debt_to_asset", "mom_6m", "mcap",
+            "date", "code", "pb", "roe", "gross_margin", "revenue_yoy",
+            "debt_to_asset", "mcap", "turnover", "mom_1m", "vol_1m",
         ])
     return pd.DataFrame(rows)
 
@@ -99,6 +118,11 @@ def neutralize_cross_section(df, factors):
 
     for f in factors:
         if f not in out.columns:
+            continue
+
+        if f in NO_NEUTRALIZE_FACTORS:
+            yv = pd.to_numeric(out[f], errors="coerce")
+            out[f"{f}_n"] = np.log(yv.clip(lower=1e-6)) if f == "mcap" else yv
             continue
 
         y = pd.to_numeric(out[f], errors="coerce")
@@ -186,25 +210,40 @@ def compute_scores(panel, weights_by_date=None):
     return pd.concat(results, ignore_index=True)
 
 
-def select_top(panel, top_n=30):
+def select_top(panel, top_n=30, suspended=None):
+    """
+    带停牌约束的选股：
+    - 停牌股不可买入；
+    - 上期持仓若本期停牌，无法卖出，强制持有顺延。
+    """
     if panel is None or panel.empty or "date" not in panel.columns:
         return {}
 
     holdings = {}
+    prev = set()
+
     for date, df in panel.groupby("date"):
+        susp = suspended.get(date, set()) if suspended else set()
         df = df.dropna(subset=["score"]).sort_values("score", ascending=False)
 
-        if "industry" in df.columns and MAX_PER_INDUSTRY:
-            chosen, count = [], {}
-            for code, ind in zip(df["code"], df["industry"]):
+        # 强制持有：上期持仓中本期停牌的（想卖卖不掉）
+        forced = [c for c in prev if c in susp]
+        chosen = list(forced)
+        count = {}
+
+        inds = df["industry"] if "industry" in df.columns else pd.Series("unknown", index=df.index)
+        for code, ind in zip(df["code"], inds):
+            if len(chosen) >= top_n:
+                break
+            if code in susp or code in chosen:
+                continue                      # 停牌买不进 / 已强制持有
+            if MAX_PER_INDUSTRY:
                 if count.get(ind, 0) >= MAX_PER_INDUSTRY:
                     continue
-                chosen.append(code)
                 count[ind] = count.get(ind, 0) + 1
-                if len(chosen) >= top_n:
-                    break
-            holdings[date] = chosen
-        else:
-            holdings[date] = df.head(top_n)["code"].tolist()
+            chosen.append(code)
+
+        holdings[date] = chosen
+        prev = set(chosen)
 
     return holdings

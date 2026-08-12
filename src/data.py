@@ -32,34 +32,38 @@ def _find_col(df, candidates):
 
 
 # ---------------- 股票池 ----------------
-def get_universe(index_symbol="000300", max_stocks=None):
-    fp = _cache_file(f"universe_{index_symbol}.csv")
+def get_universe(index_symbol, max_stocks=None):
+    """
+    获取指数成分股（支持多指数取并集），并过滤 ST / 退市风险股。
+    """
+    symbols = index_symbol if isinstance(index_symbol, (list, tuple)) else [index_symbol]
 
-    df = None
-    if fp.exists():
-        df = pd.read_csv(fp, dtype={"code": str})
-        if len(df) < 10:      # 防止读到以前的坏缓存
-            df = None
+    frames = []
+    for sym in symbols:
+        fp = _cache_file(f"universe_{sym}.csv")
+        if fp.exists():
+            df = pd.read_csv(fp, dtype={"code": str})
+        else:
+            raw = ak.index_stock_cons_csindex(symbol=sym)
+            df = pd.DataFrame({
+                "code": raw["成分券代码"].astype(str).str.zfill(6),
+                "name": raw["成分券名称"].astype(str),
+            })
+            df.to_csv(fp, index=False)
+        frames.append(df)
 
-    if df is None:
-        try:
-            raw = ak.index_stock_cons_csindex(symbol=index_symbol)
-        except Exception as e:
-            print(f"csindex 成分股 error: {e}")
-            raw = ak.index_stock_cons(symbol=index_symbol)
+    universe = pd.concat(frames, ignore_index=True).drop_duplicates("code")
 
-        code_col = _find_col(raw, ["成分券代码", "品种代码", "证券代码", "股票代码"])
-        name_col = _find_col(raw, ["成分券名称", "品种名称", "证券名称", "股票名称"])
+    # ---- ST / 退市风险过滤（*ST、ST、退市整理） ----
+    if "name" in universe.columns:
+        mask = universe["name"].str.contains("ST|退", na=False)
+        print(f"🚷 股票池 {len(universe)} 只，剔除 ST/退市风险股 {int(mask.sum())} 只")
+        universe = universe[~mask]
 
-        df = pd.DataFrame()
-        df["code"] = raw[code_col].astype(str).str.zfill(6)
-        df["name"] = raw[name_col].astype(str) if name_col else ""
-        df = df[df["code"] != index_symbol].drop_duplicates().reset_index(drop=True)
-        df.to_csv(fp, index=False)
-
-    if max_stocks is not None:
-        df = df.head(max_stocks)
-    return df
+    universe = universe.reset_index(drop=True)
+    if max_stocks:
+        universe = universe.head(max_stocks)
+    return universe
 
 
 # ---------------- 指数日线（基准 + 交易日历） ----------------
@@ -332,3 +336,49 @@ def get_industry_map(codes):
 
     m = dict(zip(full["code"].astype(str), full["industry"].astype(str)))
     return {c: m.get(c, "unknown") for c in codes}
+
+def get_suspended_map(prices, dates, max_gap_days=7):
+    """
+    判定每只股票在每个调仓日是否停牌：
+    若其最后交易日距调仓日超过 max_gap_days 个自然日，视为停牌。
+    返回 {Timestamp: set(codes)}
+    """
+    last_dates = {}
+    for code, df in prices.items():
+        if df is None or df.empty:
+            last_dates[code] = None
+        else:
+            last_dates[code] = pd.to_datetime(df["date"]).max()
+
+    result = {}
+    for d in dates:
+        d = pd.Timestamp(d)
+        result[d] = {
+            code for code, ld in last_dates.items()
+            if ld is None or (d - ld).days > max_gap_days
+        }
+    return result
+
+def get_stock_turnover(code):
+    """历史换手率：新浪日线自带 turnover 列，缓存"""
+    fp = _cache_file(f"turnover_{code}.parquet")
+    if fp.exists():
+        return pd.read_parquet(fp)
+
+    out = pd.DataFrame(columns=["date", "turnover"])
+    try:
+        prefix = "sh" if code.startswith(("6", "9")) else "sz"
+        raw = ak.stock_zh_a_daily(symbol=f"{prefix}{code}")
+        if raw is not None and not raw.empty and "turnover" in raw.columns:
+            raw = raw.copy()
+            raw["date"] = pd.to_datetime(raw["date"])
+            raw["turnover"] = pd.to_numeric(raw["turnover"], errors="coerce")
+            out = raw[["date", "turnover"]].dropna()
+            out = out[(out["date"] >= DATA_START_DATE) & (out["date"] <= END_DATE)]
+            out = out.sort_values("date").reset_index(drop=True)
+    except Exception as e:
+        print(f"{code} 新浪换手率 error: {e}")
+
+    if not out.empty:
+        out.to_parquet(fp, index=False)
+    return out

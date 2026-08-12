@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from scipy import stats
 from pathlib import Path
 from config import FACTOR_DIRECTION, OUTPUT_DIR
+from src.factors import neutralize_cross_section
 
 OUT_DIR = Path(OUTPUT_DIR)
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,57 +147,47 @@ def rolling_icir_weights(panel, fwd_ret, dates, window=12, min_periods=6):
     """
     滚动 ICIR 加权：
     对每个调仓日，只用"之前" window 个月的 IC 计算各因子权重。
-    先按日期分组做截面中性化，再基于中性化因子计算 IC，严格避免未来函数。
+    IC 基于"中性化后"的因子值计算，严格避免未来函数。
     """
-    from src.factors import neutralize_cross_section
+    base = [f for f in FACTOR_DIRECTION.keys() if f in panel.columns]
 
-    base_factors = [f for f in FACTOR_DIRECTION.keys() if f in panel.columns]
+    merged = pd.merge(panel, fwd_ret, on=["date", "code"], how="inner")
+    merged = merged.dropna(subset=["fwd_ret"])
 
-    # 按日期分组做截面中性化（每期独立），再计算 IC
-    neut_parts = []
-    for date, df in panel.groupby("date"):
-        neut_parts.append(neutralize_cross_section(df, base_factors))
-    panel_neut = pd.concat(neut_parts, ignore_index=True)
-
-    neut_cols = [f"{f}_n" for f in base_factors]
-
-    merged = pd.merge(
-        panel_neut[["date", "code"] + neut_cols],
-        fwd_ret, on=["date", "code"], how="inner",
-    ).dropna(subset=["fwd_ret"])
-
-    # 1. 每月单因子 IC（方向调整后，基于中性化因子）
+    # 1. 每月先中性化，再算每个因子的 IC（方向调整后）
     ic_rows = []
     for date, g in merged.groupby("date"):
+        gn = neutralize_cross_section(g, base)
         row = {"date": date}
-        for f in base_factors:
-            nf = f"{f}_n"
-            valid = g[[nf, "fwd_ret"]].dropna()
+        for f in base:
+            col = f"{f}_n" if f"{f}_n" in gn.columns else f
+            valid = gn[[col, "fwd_ret"]].dropna()
             if len(valid) >= 10:
-                ic, _ = stats.spearmanr(valid[nf] * FACTOR_DIRECTION[f], valid["fwd_ret"])
-                row[f] = ic   # 以原始因子名存储，确保权重能匹配到 _z 列
+                ic, _ = stats.spearmanr(valid[col] * FACTOR_DIRECTION[f], valid["fwd_ret"])
+                row[f] = ic
         ic_rows.append(row)
     ic_df = pd.DataFrame(ic_rows).set_index("date").sort_index()
 
-    # 2. 每个调仓日 -> 用过去的 IC 算 ICIR 权重
+    # 2. 每个调仓日，用"之前" window 个月的 IC 算 ICIR 权重
     weights_by_date = {}
     for date in dates:
-        past = ic_df[ic_df.index < date].tail(window)
+        past = ic_df[ic_df.index < pd.Timestamp(date)].tail(window)
         w = {}
         if len(past) >= min_periods:
-            for f in base_factors:
+            for f in base:
+                if f not in past.columns:      # 容错：因子IC全缺失时跳过
+                    continue
                 s = past[f].dropna()
                 if len(s) >= min_periods and s.std() > 0:
-                    w[f] = max(s.mean() / s.std(), 0.0)   # 负的ICIR直接归零
+                    w[f] = max(s.mean() / s.std(), 0.0)
 
         if not w or sum(w.values()) == 0:
-            w = {f: 1.0 for f in base_factors}            # 热身期 -> 等权
+            w = {f: 1.0 for f in base}         # 热身期 -> 等权
 
         total = sum(w.values())
-        weights_by_date[date] = {f: v / total for f, v in w.items()}
+        weights_by_date[pd.Timestamp(date)] = {f: v / total for f, v in w.items()}
 
     return weights_by_date
-
 
 def subperiod_ic_report(panel, fwd_ret, periods=None):
     """
